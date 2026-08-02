@@ -1,0 +1,760 @@
+"use client"
+
+import { useState, useMemo, useCallback, useEffect } from "react"
+import { useSearchParams } from "next/navigation"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog"
+import { Sidebar } from "@/components/sidebar"
+import { VentasHeader } from "@/components/ventas/ventas-header"
+import { KpiCards } from "@/components/ventas/kpi-cards"
+import { VentasToolbar } from "@/components/ventas/ventas-toolbar"
+import { AnalyticsToolbar } from "@/components/ventas/analytics-toolbar"
+import { VentasTable } from "@/components/ventas/ventas-table"
+import { VentasAnalytics } from "@/components/ventas/ventas-analytics"
+import { CorteCaja } from "@/components/ventas/corte-caja"
+import { NuevaVentaModal } from "@/components/ventas/nueva-venta-modal"
+import { DetalleVentaModal } from "@/components/ventas/detalle-venta-modal"
+import { ImprimirTicketVentaModal } from "@/components/ventas/imprimir-ticket-venta-modal"
+import { VentasService, type ExportarVentasParams, type FormatoExportacionVentas } from "@/lib/services/ventas"
+import { getMetodosPago, type MetodoPago } from "@/lib/services/metodos-pago"
+import type { 
+  Venta, 
+  VentasData, 
+  DashboardStats, 
+  SummaryBar, 
+  DetalleVenta, 
+  Pagination,
+  AnalisisVentasData 
+} from "@/lib/types/ventas"
+import { formatCurrency } from "@/lib/types/ventas"
+import { useToast } from "@/hooks/use-toast"
+import { useAuthContext } from "@/lib/contexts/auth-context"
+
+type VentasTabKey = "historial" | "analytics" | "caja"
+
+function getTodayDate(): string {
+  return new Date().toISOString().split("T")[0]
+}
+
+export default function VentasPage() {
+  const { toast } = useToast()
+  const { tienePermiso } = useAuthContext()
+  const searchParams = useSearchParams()
+  
+  // Estados principales
+  const [ventas, setVentas] = useState<Venta[]>([])
+  const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null)
+  const [summaryBar, setSummaryBar] = useState<SummaryBar | null>(null)
+  const [pagination, setPagination] = useState<Pagination>({
+    currentPage: 1,
+    limit: 10,
+    totalRecords: 0,
+    totalPages: 0,
+  })
+  const [loading, setLoading] = useState(true)
+
+  // Métodos de pago para mapeo de filtro
+  const [metodosPago, setMetodosPago] = useState<MetodoPago[]>([])
+
+  // Filters
+  const [busqueda, setBusqueda] = useState("")
+  const [periodo, setPeriodo] = useState("hoy")
+  const [metodoPagoFiltro, setMetodoPagoFiltro] = useState("todos")
+  const [formatoExportacion, setFormatoExportacion] = useState<FormatoExportacionVentas>("XLSX")
+  const [exportandoVentas, setExportandoVentas] = useState(false)
+  const [fechaInicio, setFechaInicio] = useState("")
+  const [fechaFin, setFechaFin] = useState("")
+
+  // Modals
+  const [modalNuevaVenta, setModalNuevaVenta] = useState(false)
+  const [detalleVentaId, setDetalleVentaId] = useState<number | null>(null)
+  const [ventaSeleccionada, setVentaSeleccionada] = useState<Venta | null>(null)
+  const [modalImprimirTicket, setModalImprimirTicket] = useState(false)
+  const [detalleVentaParaImprimir, setDetalleVentaParaImprimir] = useState<DetalleVenta | null>(null)
+  const [ventaParaCancelar, setVentaParaCancelar] = useState<Venta | null>(null)
+  const [cancelandoVenta, setCancelandoVenta] = useState(false)
+
+  // Active tab — inicializa desde query param ?tab=caja|analytics|historial
+  const initialTab = ((): VentasTabKey => {
+    const tab = searchParams.get("tab")
+    if (tab === "caja" || tab === "analytics" || tab === "historial") return tab
+    return "historial"
+  })()
+  const [activeTab, setActiveTab] = useState<VentasTabKey>(initialTab)
+
+  // Estados para análisis de ventas
+  const [analisisData, setAnalisisData] = useState<AnalisisVentasData | null>(null)
+  const [analisisLoading, setAnalisisLoading] = useState(false)
+  const puedeCrearVenta = tienePermiso("ventas", "crear")
+  const puedeVerAnalisis = tienePermiso("ventas", "verAnalisis")
+  const puedeExportarVentas = tienePermiso("ventas", "exportar")
+  const puedeImprimirTicket = tienePermiso("ventas", "imprimirTicket")
+  const puedeVerCaja =
+    tienePermiso("ventas", "crearCorte") ||
+    tienePermiso("ventas", "verCortesAnteriores")
+  const puedeCrearCorte = tienePermiso("ventas", "crearCorte")
+  const puedeCancelarVenta = tienePermiso("ventas", "eliminar")
+
+  const tabsDisponibles = useMemo<Array<{ key: VentasTabKey; label: string }>>(() => {
+    const tabs: Array<{ key: VentasTabKey; label: string }> = [{ key: "historial", label: "Historial" }]
+    if (puedeVerAnalisis) tabs.push({ key: "analytics", label: "Análisis" })
+    if (puedeVerCaja) tabs.push({ key: "caja", label: "Corte de Caja" })
+    return tabs
+  }, [puedeVerAnalisis, puedeVerCaja])
+
+  useEffect(() => {
+    if (!tabsDisponibles.some((tab) => tab.key === activeTab)) {
+      setActiveTab(tabsDisponibles[0]?.key ?? "historial")
+    }
+  }, [activeTab, tabsDisponibles])
+
+  // Cargar métodos de pago al montar
+  useEffect(() => {
+    async function cargarMetodosPago() {
+      try {
+        const metodos = await getMetodosPago()
+        setMetodosPago(Array.isArray(metodos) ? metodos : [])
+      } catch (error) {
+        console.error("Error al cargar métodos de pago:", error)
+        setMetodosPago([])
+      }
+    }
+    cargarMetodosPago()
+  }, [])
+
+  // Función para obtener el nombre del método de pago por ID
+  const obtenerNombreMetodoPago = (metodoPagoId: string | number): string => {
+    if (metodoPagoId === "todos" || !metodoPagoId) return "todos"
+    const metodo = metodosPago.find((m) => String(m.id) === String(metodoPagoId))
+    return metodo ? metodo.nombre : String(metodoPagoId)
+  }
+
+  // Cargar historial de ventas cuando cambien filtros simples.
+  // El rango personalizado sigue aplicándose manualmente con el botón.
+  useEffect(() => {
+    if (periodo === "personalizado") {
+      return
+    }
+
+    const debounceMs = busqueda.trim() !== "" ? 500 : 0
+    const timer = setTimeout(() => {
+      cargarVentas(1, pagination.limit)
+    }, debounceMs)
+
+    return () => clearTimeout(timer)
+  }, [periodo, metodoPagoFiltro, busqueda, pagination.limit])
+
+  // Cargar análisis cuando se cambie al tab de analytics o cambien los filtros
+  useEffect(() => {
+    if (activeTab === "analytics" && puedeVerAnalisis) {
+      cargarAnalisis()
+    }
+  }, [activeTab, periodo, fechaInicio, fechaFin, puedeVerAnalisis])
+
+  async function cargarVentas(
+    page?: number,
+    limit?: number,
+    filtrosOverride?: {
+      periodo?: string
+      fechaInicio?: string
+      fechaFin?: string
+      metodoPagoFiltro?: string
+      busqueda?: string
+    }
+  ) {
+    try {
+      setLoading(true)
+      const periodoActual = filtrosOverride?.periodo ?? periodo
+      const fechaInicioActual = filtrosOverride?.fechaInicio ?? fechaInicio
+      const fechaFinActual = filtrosOverride?.fechaFin ?? fechaFin
+      const metodoPagoActual = filtrosOverride?.metodoPagoFiltro ?? metodoPagoFiltro
+      const busquedaActual = filtrosOverride?.busqueda ?? busqueda
+
+      const params: any = {
+        page: page || pagination.currentPage,
+        limit: limit || pagination.limit,
+      }
+
+      const periodoMap: Record<string, string> = {
+        hoy: "Hoy",
+        ayer: "Ayer",
+        semana: "Esta Semana",
+        mes: "Este Mes",
+        trimestre: "Este Trimestre",
+        anio: "Este Año",
+        personalizado: "Personalizado",
+      }
+      
+      // Filtro por período
+      if (periodoActual === "personalizado") {
+        params.periodo = "Personalizado"
+        if (fechaInicioActual) params.fecha_inicio = fechaInicioActual
+        if (fechaFinActual) params.fecha_fin = fechaFinActual
+      } else if (periodoActual !== "todo") {
+        params.periodo = periodoMap[periodoActual] || periodoActual
+      } else {
+        // Para "todo" no enviamos periodo y el backend devuelve el historial completo.
+      }
+      
+      // Filtro por método de pago (convertir ID a nombre para backend)
+      if (metodoPagoActual && metodoPagoActual !== "todos") {
+        const nombreMetodo = obtenerNombreMetodoPago(metodoPagoActual)
+        if (nombreMetodo && nombreMetodo !== "todos") {
+          params.metodo_pago = nombreMetodo
+        }
+      }
+      
+      // Filtro por búsqueda (ahora va al backend)
+      if (busquedaActual.trim()) {
+        params.search = busquedaActual.trim()
+      }
+      
+      console.log('📊 Cargando ventas con parámetros:', params)
+      const data = await VentasService.getAll(params)
+      setVentas(data.ventas)
+      setDashboardStats(data.dashboardStats)
+      setSummaryBar(data.summaryBar)
+      setPagination(data.pagination)
+      console.log('✅ Ventas cargadas:', data.ventas.length)
+      console.log('📄 Paginación:', data.pagination)
+    } catch (error: any) {
+      console.error('❌ Error al cargar ventas:', error)
+      toast({
+        title: "Error",
+        description: error.message || "No se pudieron cargar las ventas",
+        variant: "destructive",
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Cargar análisis de ventas desde el API
+  async function cargarAnalisis() {
+    try {
+      setAnalisisLoading(true)
+      const params: any = {}
+      
+      // Mapear períodos en español a formato del backend
+      const periodoMap: Record<string, string> = {
+        "hoy": "Hoy",
+        "ayer": "Ayer",
+        "semana": "Esta Semana",
+        "mes": "Este Mes",
+        "trimestre": "Este Trimestre",
+        "anio": "Este Año",
+        "todo": "Todo",
+        "personalizado": "Personalizado",
+      }
+      
+      // Filtro por período
+      if (periodo === "personalizado") {
+        params.periodo = "Personalizado"
+        if (fechaInicio) params.fecha_inicio = fechaInicio
+        if (fechaFin) params.fecha_fin = fechaFin
+      } else {
+        // Siempre enviar el período, incluso cuando es "todo"
+        params.periodo = periodoMap[periodo] || periodo
+      }
+      
+      console.log('📊 Cargando análisis de ventas con parámetros:', params)
+      const data = await VentasService.getAnalysis(params)
+      console.log('✅ Análisis cargado:', {
+        tendenciaVentas: data.tendenciaVentas.length,
+        primeraFecha: data.tendenciaVentas[0]?.fecha,
+        ultimaFecha: data.tendenciaVentas[data.tendenciaVentas.length - 1]?.fecha,
+      })
+      setAnalisisData(data)
+    } catch (error: any) {
+      console.error('❌ Error al cargar análisis:', error)
+      toast({
+        title: "Error",
+        description: error.message || "No se pudo cargar el análisis de ventas",
+        variant: "destructive",
+      })
+      // Establecer datos vacíos para evitar crashes
+      setAnalisisData({
+        comparacionActual: {
+          actual: { total: 0, transacciones: 0 },
+          anterior: { total: 0, transacciones: 0 },
+          variacion_porcentaje: 0,
+        },
+        tendenciaVentas: [],
+        topProductos: [],
+        metodosPago: [],
+        insights: ["No hay datos disponibles para el período seleccionado."],
+      })
+    } finally {
+      setAnalisisLoading(false)
+    }
+  }
+
+  // Handlers de paginación
+  const handlePageChange = useCallback((newPage: number) => {
+    console.log('📄 Cambiando a página:', newPage)
+    cargarVentas(newPage, pagination.limit)
+  }, [pagination.limit, periodo, fechaInicio, fechaFin, metodoPagoFiltro, busqueda])
+
+  const handleLimitChange = useCallback((newLimit: number) => {
+    console.log('📊 Cambiando límite a:', newLimit)
+    cargarVentas(1, newLimit) // Resetear a página 1 al cambiar límite
+  }, [periodo, fechaInicio, fechaFin, metodoPagoFiltro, busqueda])
+
+  // Ahora los datos vienen filtrados desde el backend, no necesitamos filtrado local
+  const ventasFiltradas = ventas
+
+  // KPI data desde el API
+  const kpiData = useMemo(() => {
+    if (!dashboardStats) {
+      return {
+        ventasHoy: 0,
+        ventasAyer: 0,
+        transaccionesHoy: 0,
+        promedioTransaccion: 0,
+        productosVendidosHoy: 0,
+        productosVendidosAyer: 0,
+        ventasMes: 0,
+        metaMes: 0,
+      }
+    }
+
+    return {
+      ventasHoy: dashboardStats.ventasDia.total,
+      ventasAyer: 0, // Calculado desde porcentajeVsAyer si es necesario
+      transaccionesHoy: dashboardStats.transacciones.total,
+      promedioTransaccion: dashboardStats.transacciones.promedioTicket,
+      productosVendidosHoy: dashboardStats.productosVendidos.total,
+      productosVendidosAyer: 0, // Calculado desde porcentajeVsAyer si es necesario
+      ventasMes: dashboardStats.ventasMes.total,
+      metaMes: dashboardStats.ventasMes.metaAlcanzada,
+    }
+  }, [dashboardStats])
+
+  // Handlers
+  const handleNuevaVenta = useCallback(
+    async (data: { socio_id: number | null; pagos?: Array<{metodo_pago_id: number; monto: number}>; metodo_pago_id?: number; productos: { producto_id: number; cantidad: number }[] }) => {
+      try {
+        console.log('📤 Creando venta:', data)
+        const resultado = await VentasService.create(data)
+        
+        console.log('✅ Venta creada:', resultado)
+        
+        toast({
+          title: "¡Venta registrada!",
+          description: `Venta ID: ${resultado.venta_id} - Total: ${formatCurrency(parseFloat(resultado.total_cobrado))}`,
+        })
+        
+        setModalNuevaVenta(false)
+        
+        // Recargar ventas después de crear
+        await cargarVentas()
+        
+        // Obtener detalle de la venta para imprimir
+        try {
+          console.log('📄 Obteniendo detalle de venta para imprimir...')
+          const detalleVenta = await VentasService.getById(resultado.venta_id)
+          if (puedeImprimirTicket) {
+            setDetalleVentaParaImprimir(detalleVenta)
+            setModalImprimirTicket(true)
+          }
+        } catch (errorDetalle: any) {
+          console.error('❌ Error al obtener detalle para impresión:', errorDetalle)
+          // No bloqueamos el flujo, solo notificamos
+        }
+      } catch (error: any) {
+        console.error('❌ Error al crear venta:', error)
+        toast({
+          title: "Error",
+          description: error.message || "No se pudo registrar la venta",
+          variant: "destructive",
+        })
+      }
+    },
+    [toast, puedeImprimirTicket]
+  )
+
+  const handleLimpiarFiltros = useCallback(() => {
+    console.log('🧹 Limpiando filtros...')
+    setBusqueda("")
+    setPeriodo("hoy")
+    setMetodoPagoFiltro("todos")
+    setFechaInicio("")
+    setFechaFin("")
+  }, [])
+
+  const handleExportar = useCallback(async () => {
+    if (!puedeExportarVentas) {
+      return
+    }
+
+    if (periodo === "personalizado" && (!fechaInicio || !fechaFin)) {
+      toast({
+        title: "Completa el rango de fechas",
+        description: "Selecciona fecha inicio y fecha fin para exportar ventas personalizadas.",
+      })
+      return
+    }
+
+    if (pagination.totalRecords === 0) {
+      toast({
+        title: "Sin datos",
+        description: "No hay ventas para exportar con los filtros actuales.",
+      })
+      return
+    }
+
+    try {
+      setExportandoVentas(true)
+      const periodoMap: Record<string, string> = {
+        hoy: "Hoy",
+        ayer: "Ayer",
+        semana: "Esta Semana",
+        mes: "Este Mes",
+        trimestre: "Este Trimestre",
+        anio: "Este Año",
+        personalizado: "Personalizado",
+      }
+
+      const params: ExportarVentasParams = {
+        formato: formatoExportacion,
+      }
+
+      if (periodo === "personalizado") {
+        params.periodo = "Personalizado"
+        params.fecha_inicio = fechaInicio
+        params.fecha_fin = fechaFin
+      } else if (periodo !== "todo") {
+        params.periodo = periodoMap[periodo] || periodo
+      }
+
+      if (metodoPagoFiltro && metodoPagoFiltro !== "todos") {
+        const nombreMetodo = obtenerNombreMetodoPago(metodoPagoFiltro)
+        if (nombreMetodo && nombreMetodo !== "todos") {
+          params.metodo_pago = nombreMetodo
+        }
+      }
+
+      if (busqueda.trim()) {
+        params.search = busqueda.trim()
+      }
+
+      await VentasService.exportar(params)
+
+      toast({
+        title: "Exportación completada",
+        description: `Se exportaron ${pagination.totalRecords} ventas con los filtros actuales.`,
+      })
+    } catch (error) {
+      console.error("Error al exportar ventas:", error)
+      toast({
+        title: "Error",
+        description: "No se pudo exportar el archivo seleccionado",
+        variant: "destructive",
+      })
+    } finally {
+      setExportandoVentas(false)
+    }
+  }, [
+    puedeExportarVentas,
+    periodo,
+    fechaInicio,
+    fechaFin,
+    pagination.totalRecords,
+    formatoExportacion,
+    metodoPagoFiltro,
+    busqueda,
+    toast,
+    metodosPago,
+  ])
+
+  const handleAplicarFiltros = useCallback(() => {
+    if (periodo === "personalizado" && fechaInicio && fechaFin) {
+      console.log('🔍 Aplicando filtros personalizados:', { periodo, fechaInicio, fechaFin })
+      cargarVentas(1, pagination.limit)
+      toast({
+        title: "Filtros aplicados",
+        description: `Buscando ventas en el rango seleccionado`,
+      })
+    }
+  }, [periodo, fechaInicio, fechaFin, pagination.limit])
+
+  const handlePrintInvoice = useCallback((detalleVenta: DetalleVenta) => {
+    console.log('📄 Imprimiendo invoice para venta:', detalleVenta.idVentaStr)
+    setDetalleVentaParaImprimir(detalleVenta)
+    setModalImprimirTicket(true)
+    setDetalleVentaId(null) // Cerrar modal de detalle
+  }, [])
+
+  const handleSolicitarCancelacion = useCallback((venta: Venta) => {
+    if (!puedeCancelarVenta) return
+    if (venta.status === 'cancelada') return
+    setVentaParaCancelar(venta)
+  }, [puedeCancelarVenta])
+
+  const handleConfirmarCancelacion = useCallback(async () => {
+    if (!ventaParaCancelar) return
+
+    try {
+      setCancelandoVenta(true)
+      const response = await VentasService.cancelar(ventaParaCancelar.id)
+
+      toast({
+        title: 'Venta cancelada',
+        description: response.message || `La venta ${ventaParaCancelar.idVenta} fue cancelada correctamente.`,
+      })
+
+      setVentaSeleccionada((prev) => prev && prev.id === ventaParaCancelar.id ? { ...prev, status: 'cancelada' } : prev)
+      setVentas((prev) => prev.map((v) => v.id === ventaParaCancelar.id ? { ...v, status: 'cancelada' } : v))
+      setVentaParaCancelar(null)
+
+      await cargarVentas(pagination.currentPage, pagination.limit)
+    } catch (error: any) {
+      console.error('❌ Error al cancelar venta:', error)
+      toast({
+        title: 'No se pudo cancelar',
+        description: error.message || 'No fue posible cancelar la venta seleccionada',
+        variant: 'destructive',
+      })
+    } finally {
+      setCancelandoVenta(false)
+    }
+  }, [ventaParaCancelar, pagination.currentPage, pagination.limit, toast])
+
+  if (loading) {
+    return (
+      <div className="flex h-screen overflow-hidden bg-background">
+        <Sidebar activePage="ventas" />
+        <main className="flex-1 flex items-center justify-center">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+            <p className="text-muted-foreground">Cargando ventas...</p>
+          </div>
+        </main>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-background">
+      <Sidebar activePage="ventas" />
+
+      <main className="flex-1 flex flex-col min-h-0">
+        <VentasHeader />
+
+        <div className="flex-1 overflow-y-auto px-4 py-3 md:px-6 space-y-3">
+          {/* KPIs - Dinámicos según tab */}
+          {activeTab !== "caja" && (
+            <KpiCards data={kpiData} />
+          )}
+
+          {/* Summary Bar */}
+          {summaryBar && (
+            <div className="bg-card rounded-lg p-3 border border-border shadow-sm">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div className="flex items-center gap-4 flex-wrap">
+                  <span className="text-sm text-muted-foreground">
+                    Período: <span className="text-foreground font-semibold">{summaryBar.rango}</span>
+                  </span>
+                  <span className="text-muted-foreground">
+                    Total: <span className="text-primary font-bold">{formatCurrency(summaryBar.totalFiltrado)}</span>
+                  </span>
+                  <span className="text-muted-foreground">
+                    Ventas: <span className="text-foreground font-medium">{summaryBar.ventasCount}</span>
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Tabs */}
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-1 bg-card rounded-lg p-1" style={{ boxShadow: "0 2px 8px rgba(0,0,0,0.2)" }}>
+              {tabsDisponibles.map((tab) => (
+                <button
+                  key={tab.key}
+                  onClick={() => setActiveTab(tab.key)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-200 ${
+                    activeTab === tab.key
+                      ? "bg-primary text-primary-foreground glow-primary"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Content */}
+          <div className="space-y-3">
+            {activeTab === "historial" && (
+              <>
+                {/* Toolbar with Filters */}
+                <VentasToolbar
+                  busqueda={busqueda}
+                  onBusquedaChange={setBusqueda}
+                  periodo={periodo}
+                  onPeriodoChange={setPeriodo}
+                  metodoPago={metodoPagoFiltro}
+                  onMetodoPagoChange={setMetodoPagoFiltro}
+                  formatoExportacion={formatoExportacion}
+                  onFormatoExportacionChange={setFormatoExportacion}
+                  fechaInicio={fechaInicio}
+                  onFechaInicioChange={setFechaInicio}
+                  fechaFin={fechaFin}
+                  onFechaFinChange={setFechaFin}
+                  onLimpiar={handleLimpiarFiltros}
+                  onNuevaVenta={() => setModalNuevaVenta(true)}
+                  onAplicarFiltros={handleAplicarFiltros}
+                  onExportar={handleExportar}
+                  totalVentas={pagination.totalRecords}
+                  canCrearVenta={puedeCrearVenta}
+                  canExportar={puedeExportarVentas}
+                  exportando={exportandoVentas}
+                />
+
+                {/* Table */}
+                <VentasTable
+                  ventas={ventasFiltradas}
+                  pagination={pagination}
+                  onPageChange={handlePageChange}
+                  onLimitChange={handleLimitChange}
+                  onVerDetalle={(venta) => {
+                    setVentaSeleccionada(venta)
+                    setDetalleVentaId(venta.id)
+                  }}
+                  onCancelarVenta={handleSolicitarCancelacion}
+                  puedeCancelarVenta={puedeCancelarVenta}
+                />
+              </>
+            )}
+
+            {activeTab === "analytics" && puedeVerAnalisis && (
+              <>
+                {/* Toolbar de filtros para análisis */}
+                <AnalyticsToolbar
+                  periodo={periodo}
+                  onPeriodoChange={setPeriodo}
+                  fechaInicio={fechaInicio}
+                  onFechaInicioChange={setFechaInicio}
+                  fechaFin={fechaFin}
+                  onFechaFinChange={setFechaFin}
+                  onActualizar={cargarAnalisis}
+                  loading={analisisLoading}
+                />
+
+                {analisisData ? (
+                  <VentasAnalytics
+                    analisisData={analisisData}
+                    periodoLabel={periodo === "personalizado" ? "Personalizado" : periodo}
+                    loading={analisisLoading}
+                  />
+                ) : analisisLoading ? (
+                  <div className="flex items-center justify-center h-96">
+                    <div className="text-center">
+                      <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+                      <p className="text-muted-foreground">Cargando análisis...</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-center h-96">
+                    <p className="text-muted-foreground">No hay datos de análisis disponibles</p>
+                  </div>
+                )}
+              </>
+            )}
+
+            {activeTab === "caja" && puedeVerCaja && (
+              <CorteCaja
+                ventasHoy={ventas}
+                allVentas={ventas}
+                fondoInicial={5000}
+                canCrearCorte={puedeCrearCorte}
+                canExportar={puedeExportarVentas}
+              />
+            )}
+          </div>
+        </div>
+      </main>
+
+      {/* Modals */}
+      <NuevaVentaModal
+        open={modalNuevaVenta && puedeCrearVenta}
+        onClose={() => setModalNuevaVenta(false)}
+        onConfirm={handleNuevaVenta}
+      />
+
+      <DetalleVentaModal
+        ventaId={detalleVentaId}
+        open={!!detalleVentaId}
+        onClose={() => {
+          setDetalleVentaId(null)
+          setVentaSeleccionada(null)
+        }}
+        onPrintInvoice={puedeImprimirTicket ? handlePrintInvoice : undefined}
+        ventaContexto={ventaSeleccionada}
+        onSolicitarCancelacion={handleSolicitarCancelacion}
+      />
+
+      {puedeImprimirTicket && (
+        <ImprimirTicketVentaModal
+          open={modalImprimirTicket}
+          onClose={() => {
+            setModalImprimirTicket(false)
+            setDetalleVentaParaImprimir(null)
+          }}
+          detalleVenta={detalleVentaParaImprimir}
+        />
+      )}
+
+      <Dialog open={!!ventaParaCancelar} onOpenChange={(open) => !open && setVentaParaCancelar(null)}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Cancelar venta</DialogTitle>
+            <DialogDescription>
+              Esta acción revertirá stock y caja. Solo debe hacerse si realmente necesitas anular la venta.
+            </DialogDescription>
+          </DialogHeader>
+
+          {ventaParaCancelar && (
+            <div className="space-y-3 rounded-xl border border-destructive/20 bg-destructive/5 p-4 text-sm">
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-muted-foreground">Venta</span>
+                <span className="font-semibold text-foreground">{ventaParaCancelar.idVenta}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-muted-foreground">Cliente</span>
+                <span className="font-medium text-foreground text-right">{ventaParaCancelar.cliente}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-muted-foreground">Total</span>
+                <span className="font-semibold text-foreground">{formatCurrency(ventaParaCancelar.total)}</span>
+              </div>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                Se generarán movimientos de reversión en inventario y caja. Si el corte asociado ya fue cerrado, el backend rechazará la operación.
+              </p>
+            </div>
+          )}
+
+          <DialogFooter>
+            <button
+              type="button"
+              onClick={() => setVentaParaCancelar(null)}
+              className="px-4 py-2 rounded-lg border border-border text-foreground hover:bg-muted transition-colors"
+              disabled={cancelandoVenta}
+            >
+              No, volver
+            </button>
+            <button
+              type="button"
+              onClick={handleConfirmarCancelacion}
+              className="px-4 py-2 rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors disabled:opacity-60"
+              disabled={cancelandoVenta}
+            >
+              {cancelandoVenta ? 'Cancelando...' : 'Sí, cancelar venta'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
